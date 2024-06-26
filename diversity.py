@@ -1,12 +1,18 @@
 import numpy as np
-import time
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
+from rdkit.Chem.Scaffolds import MurckoScaffold
 import six
 import sys
 sys.modules['sklearn.externals.six'] = six
 import random
 from tqdm import tqdm
+
+import networkx as nx
+from python_tsp.exact import solve_tsp_dynamic_programming
+from python_tsp.heuristics import solve_tsp_local_search
+from utils import identify_functional_groups, GetRingSystems
+
 
 def dist_array(smiles = None, mols = None):
     if mols == None:
@@ -14,6 +20,9 @@ def dist_array(smiles = None, mols = None):
         mols = [Chem.MolFromSmiles(s) for s in smiles]
     else:
         l = len(mols)
+    '''
+    You can replace the Tanimoto distances of ECFPs with other molecular distance metrics!
+    '''
     sims = np.zeros((l, l))    
     fps = [Chem.AllChem.GetMorganFingerprintAsBitVect(x, radius = 2, nBits = 2048) for x in mols]
     disable = (l <= 2000)
@@ -24,15 +33,55 @@ def dist_array(smiles = None, mols = None):
             sims[j, i] = sims[i, j]
     dists = 1 - sims
     return dists
+
     
-    
-def diversity_all(smiles = None, mols = None, dists = None, mode = "IntDiv", args = None, disable = False):
+def diversity_all(smiles = None, mols = None, dists = None, mode = "HamDiv", args = None, disable = False):
+    if mode == "Richness":
+        if smiles != None:
+            return len(set(smiles))
+        else:
+            smiles = set()
+            for mol in mols:
+                smiles.add(Chem.MolToSmiles(mol))
+            return len(smiles)
+    elif mode == "FG":
+        func_groups = set()
+        for i in range(len(mols) if mols is not None else len(smiles)):
+            smi = Chem.MolToSmiles(mols[i]) if smiles is None else smiles[i]
+            grps = identify_functional_groups(smi)
+            func_groups.update(grps)
+
+        return(len(func_groups))
+
+    elif mode == "RS":
+        ring_sys = set()
+        for i in range(len(mols) if mols is not None else len(smiles)):
+            smi = Chem.MolToSmiles(mols[i]) if smiles is None else smiles[i]
+            grps = GetRingSystems(smi)
+            ring_sys.update(grps)
+
+        return(len(ring_sys))
+
+    elif mode == "BM":
+        scaffolds = set()
+        for i in range(len(mols) if mols is not None else len(smiles)):
+            if mols is not None:
+                scaf = MurckoScaffold.GetScaffoldForMol(mols[i])
+            else:
+                mol = Chem.MolFromSmiles(smiles[i])
+                scaf = MurckoScaffold.GetScaffoldForMol(mol)
+            scaf_smi = Chem.MolToSmiles(scaf)
+            scaffolds.update([scaf_smi])
+
+        return(len(scaffolds))
+
+
     if type(dists) is np.ndarray:
         l = len(dists)
     elif mols == None:
         l = len(smiles)
         assert l >= 2
-        dists = dist_array(smiles, mols)
+        dists = dist_array(smiles)
     else:
         l = len(mols)
         assert l >= 2
@@ -88,15 +137,6 @@ def diversity_all(smiles = None, mols = None, dists = None, mode = "IntDiv", arg
         return sum_d_min
     elif mode == "DPP":
         return np.linalg.det(1 - dists)
-    elif mode == "Richness":
-        if smiles != None:
-            return len(set(smiles))
-        else:
-            smiles = set()
-            for mol in mols:
-                smiles.add(Chem.MolToSmiles(mol))
-            return len(smiles)
-        
     elif mode.split('-')[0] == 'NCircles':
         threshold = float(mode.split('-')[1])
         circs_sum = []
@@ -112,52 +152,50 @@ def diversity_all(smiles = None, mols = None, dists = None, mode = "IntDiv", arg
                         break
                 circs[i] = circs_i
             circs_sum.append(np.sum(circs))
-        return np.max(np.array(circs_sum))
-            
+        return np.max(np.array(circs_sum))            
     elif mode == "HamDiv":
-        if l == 1:
-            return 0
-        alpha = 0 if args == None else args
-        total = 0
-        remove = np.zeros(l)
-        for i in range(l):
-            d_i_min = 1
-            for j in range(l):
-                if j != i and remove[j] == 0 and d_i_min > dists[i, j]:
-                    d_i_min = dists[i, j]
-            if d_i_min <= alpha: # acceleration parameter
-                remove[i] = 1
-                total += 2 * d_i_min
-        remove = np.argwhere(remove == 1)
-        dists = np.delete(dists, remove, axis = 0)
-        dists = np.delete(dists, remove, axis = 1)
-        
-        total, seq = greedy_TSP(dists, disable = disable)
-        total = 0
-        
-        for i in range(1, len(seq)):
-            total += dists[seq[i - 1], seq[i]]
-        total += dists[seq[0], seq[-1]]
-        
+        total = HamDiv(dists=dists)
         return total
+    
     else:
         raise Error('Mode Undefined!')
 
 
-def greedy_TSP(dists, start_index = 0, disable = False):
-    l = dists.shape[0]
+def HamDiv(smiles = None, mols = None, dists=None, method="greedy_tsp"):
+    l = dists.shape[0] if dists is not None else len(mols) if mols is not None else len(smiles)
+    if l == 1:
+        return 0
+    dists = dist_array(smiles) if dists is None else dists
     
-    seq_result = [start_index]
-    total = 0
-    for k in tqdm(range(l - 1), disable = disable):
-        distance_list = dists[start_index]
-        min_dis = 2
-        for i in range(l):
-            if (min_dis > distance_list[i]) and (i not in seq_result):
-                min_dis = distance_list[i]
-                start_index = i
-        total += min_dis
-        seq_result += [start_index]
-        
-    total += dists[seq_result[0], seq_result[-1]]
-    return total, seq_result
+    remove = np.zeros(l)
+    for i in range(l):
+        for j in range(i + 1, l):
+            if dists[i, j] == 0:
+                remove[i] = 1
+    remove = np.argwhere(remove == 1)
+    dists = np.delete(dists, remove, axis = 0)
+    dists = np.delete(dists, remove, axis = 1)
+    
+    G = nx.from_numpy_array(dists)
+    
+    if method == "exact_dp":
+        tsp, total = solve_tsp_dynamic_programming(dists)
+    elif method == "christofides":
+        tsp = nx.approximation.christofides(G, weight='weight')
+    elif method == "greedy_tsp":
+        tsp = nx.approximation.greedy_tsp(G, weight='weight')
+    elif method == "simulated_annealing_tsp":
+        tsp = nx.approximation.simulated_annealing_tsp(G, init_cycle="greedy", weight='weight')
+    elif method == "threshold_accepting_tsp":
+        tsp = nx.approximation.threshold_accepting_tsp(G, init_cycle="greedy", weight='weight')
+    elif method == "local_search":
+        tsp, total = solve_tsp_local_search(dists, max_processing_time=300)
+    else:
+        Exception("Undefined method")
+    
+    if method not in ["exact_dp", "local_search"]:
+        total = 0
+        for i in range(1, len(tsp)):
+            total += dists[tsp[i - 1], tsp[i]]
+    
+    return total
